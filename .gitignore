@@ -163,6 +163,4 @@ cython_debug/
 
 # Data collection stuff
 src/data_collection.py
-data/raw/
-data/processed_videos.csv
-data/thumbnails/
+data/
