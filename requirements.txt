@@ -1,0 +1,12 @@
+numpy
+pandas
+matplotlib
+scikit-learn
+tensorflow
+opencv-python
+requests
+nltk==3.8.1
+python-dotenv
+pillow
+tesseract
+pytesseract
