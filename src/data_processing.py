@@ -1,7 +1,7 @@
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
-import pytesseract
+import easyocr
 import pandas as pd
 import numpy as np
 from PIL import Image, ImageStat
@@ -12,7 +12,9 @@ import os
 
 # Initialize stuff
 nltk.download('vader_lexicon')
+
 sid = SentimentIntensityAnalyzer()
+reader = easyocr.Reader(['en'], gpu = True)
 
 # Clean the Data
 def get_highest_quality_thumbnail(video_id):
@@ -77,9 +79,9 @@ def get_thumbnail_attributes(thumbnail_path):
     return (perceived_brightness, saturation, contrast)
 
 def detect_thumbnail_text(thumbnail_path):
-    thumbnail = Image.open(thumbnail_path)
-    text = pytesseract.image_to_string(thumbnail, config='--psm 6 --oem 3')
-    return text
+    thumbnail = cv2.imread(thumbnail_path)
+    results = reader.readtext(thumbnail)
+    return " ".join([text for _, text, _ in results])
 
 def detect_thumbnail_objects(thumbnail_path):
     None
@@ -115,7 +117,7 @@ def read_csv(csv):
         video['thumbnail_contrast'] = contrast
         
         if thumbnail_text:
-            print(f"({video_id}) Text detected in the thumbnail: {thumbnail_text}")
+            print(f"({video_id}) Text detected in the thumbnail: {thumbnail_text}") # For debugging
         
         processed_videos.append(video)
             
