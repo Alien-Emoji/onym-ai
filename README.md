@@ -8,7 +8,7 @@ Ideally, the optimal metric for the model to predict would be the video's Click-
 Before committing to VSR as the predictive metric, I conducted an initial analysis using data from my own YouTube channel to assess its statistical viability. The results showed a moderate positive correlation between VSR and CTR (r ≈ 0.48, p ≈ 0.036). Although this level of correlation isn't ideal, it suggests that VSR can serve as a reasonable proxy for CTR in this application.
 
 Below is a scatter plot showing the relationship between VSR and CTR, revealing a moderately positive trendline:
-![Scatter Plot showing the Correlation between VSR and CTR, revealing a moderately positive trendline](images\Chart.webp)
+![Scatter Plot showing the Correlation between VSR and CTR, revealing a moderately positive trendline](images\Chart.png)
 
 Although the initial analysis is based on a limited and unrefined dataset, it provides enough evidence for me to confidently proceed with the project. I aim to further explore and refine the correlation between VSR and CTR to improve the model's predictive accuracy.
 
