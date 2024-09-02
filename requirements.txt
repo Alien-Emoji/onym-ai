@@ -1,7 +1,7 @@
 pandas
 opencv-python
 requests
-nltk==3.8.1
+spacy
 gensim
 transformers
 torch
