@@ -1,74 +1,130 @@
-import pandas as pd
-import requests
-import cv2
+# pylint: disable=E1101
+# pylint: disable=C0303
+# pylint: disable=C0116
+
 import os
 import re
 import ast
 from collections import Counter
-
+import logging
+import asyncio
+import aiohttp
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError
+import numpy as np
+import pandas as pd
+import cv2
 import spacy
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 nlp = spacy.load("en_core_web_sm")
 
+# Constants
+REQUIRED_COLUMNS = ["vsr", "description", "title"]
+CROP_TOP = 45
+CROP_BOTTOM = 315
+CROP_WIDTH = 480
+TARGET_WIDTH = 1280
+TARGET_HEIGHT = 720
+
 # Retrieve video thumbnail
-def get_highest_quality_thumbnail(video_id):
+async def get_highest_quality_thumbnail(video_id: str, session: aiohttp.ClientSession, timeout: int = 5) -> str:
     thumbnail_url = f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg"
-    response = requests.get(thumbnail_url)
+    try:
+        async with session.get(thumbnail_url, timeout=timeout) as response:
+            if response.status == 200:
+                return thumbnail_url
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        logging.warning("Request for maxresdefault thumbnail failed for %s. Falling back to hqdefault.", video_id)
+        
+    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg" # Fallback to hqdefault
+
+@retry(wait=wait_exponential(multiplier=1, min=2, max=5), stop=stop_after_attempt(5), retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)))
+async def download_thumbnail(session: aiohttp.ClientSession, url: str, timeout: int = 5) -> bytes:
+    try:
+        async with session.get(url, timeout=timeout) as response:
+            if response.status == 200:
+                return await response.read()
+            elif response.status in {500, 502, 503, 504}:
+                raise aiohttp.ClientError(f"Server error: {response.status}")
+            else:
+                logging.warning("Failed to download %s with status code: %s", url, response.status)
+                return None
+    except asyncio.TimeoutError:
+        logging.warning("Request to %s timed out.", url)
+        raise
+    except aiohttp.ClientError as e:
+        logging.warning("Client error occured for %s: %s", url, e)
+        raise
     
-    if response.status_code == 200:
-        return thumbnail_url
-    else:
-        return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg" # Fall back to hqdefault
-    
-def save_thumbnail(video_id):
+async def download_thumbnail_with_fallback(session: aiohttp.ClientSession, url: str, timeout: int = 5) -> bytes:
+    try:
+        result = await download_thumbnail(session, url, timeout)
+        return result
+    except RetryError:
+        logging.error("Failed to download thumbnail: %s", url)
+        return None
+
+async def save_thumbnail(video_id: str, session: aiohttp.ClientSession, timeout: int = 5) -> str:
     # Download & process the video thumbnail for analysis
     thumbnail_path = f"data/thumbnails/{video_id}.jpg"
-    thumbnail_url = get_highest_quality_thumbnail(video_id)
     
-    # Make sure the thumbnails directory exists
-    os.makedirs(os.path.dirname(thumbnail_path), exist_ok = True)
+    if os.path.exists(thumbnail_path):
+        logging.info("Thumbnail already exists for %s", video_id)
+        return thumbnail_path
     
-    if not os.path.exists(thumbnail_path):
-        img_data = requests.get(thumbnail_url).content
-        with open(thumbnail_path, "wb") as handler:
-            handler.write(img_data)
-            
+    thumbnail_url = await get_highest_quality_thumbnail(video_id, session)
+    response = await download_thumbnail_with_fallback(session, thumbnail_url, timeout)
+    
+    if response is None:
+        logging.warning("Failed to download or decode thumbnail for %s", video_id)
+        return None
+    
+    img_data = np.frombuffer(response, np.uint8)
+    thumbnail = cv2.imdecode(img_data, cv2.IMREAD_COLOR)
+    
+    if thumbnail is not None:
         # If we have hqdefault, crop off the black bars
         if "hqdefault" in thumbnail_url:
-            thumbnail = cv2.imread(thumbnail_path)
-            cropped_image = thumbnail[45:315, 0:480] # Crop to 480x270 (16:9 aspect ratio)
-            resized_image = cv2.resize(cropped_image, (1280, 720), interpolation = cv2.INTER_AREA) # Resize to match with maxresdefault
+            cropped_image = thumbnail[CROP_TOP:CROP_BOTTOM, 0:CROP_WIDTH] # Crop to 480x270 (16:9 aspect ratio)
+            resized_image = cv2.resize(cropped_image, (TARGET_WIDTH, TARGET_HEIGHT), interpolation=cv2.INTER_AREA)
             cv2.imwrite(thumbnail_path, resized_image)
-            
+        else:
+            cv2.imwrite(thumbnail_path, thumbnail) # Directly save maxresdefault thumbnails
+    else:
+        logging.warning("Failed to decode thumbnail for %s", video_id)
+        return None
+        
     return thumbnail_path
 
 # Determine video topic
-def is_url_token(token):
+def is_url_token(token: str) -> bool:
     url_patterns = ["http", "www", ".com", ".net", ".org", ".io", ".gov", ".edu", ".ly"]
     return any(pattern in token for pattern in url_patterns)
 
-def preprocess_text(text):
-    entity_pass = nlp(text)
-    entities = [entity.text for entity in entity_pass.ents]
+def extract_entities_and_tokens(doc) -> tuple[list[str], list[str]]:
+    # Extract entities & store their start and end positions
+    entities = [entity.text for entity in doc.ents]
+    entity_tokens = {token.idx for entity in doc.ents for token in entity}
     
-    # Remove entities from this pass
-    filtered_text = text
-    for entity in entities:
-        filtered_text = filtered_text.replace(entity, "")
-        
-    filtered_text = " ".join(filtered_text.split())
-    
-    nlp_text = nlp(filtered_text)
-    tokens = [
-        token.lemma_.lower()
-        for token in nlp_text
-        if not token.is_stop and not token.is_punct and len(token) > 2 and not is_url_token(token.text.lower())
+    # Exclude non-entity tokens
+    filtered_text = [
+        token.lemma_.lower() for token in doc
+        if not token.is_stop and not token.is_punct and len(token) > 2 and token.idx not in entity_tokens
     ]
     
-    return (tokens, entities)
+    return filtered_text, entities
 
-def process_tags(tag_list, entities):
-    # Move longer entities to the front.
-    # If there are any entities contained in others, these entities will be longer and therefore come first in the list.
+def tokenize_texts(texts: list[str]) -> list[tuple[list[str], list[str]]]:
+    docs = nlp.pipe(texts)
+    results = []
+    
+    for doc in docs:
+        tokens, entities = extract_entities_and_tokens(doc)
+        results.append((tokens, entities))
+        
+    return results
+
+def tokenize_tags(tag_list: list[str], entities: list[str]) -> list[str]:
     lowercase_entities = sorted([entity.lower() for entity in entities], key=len, reverse=True)
     
     refined_tags = []
@@ -91,8 +147,8 @@ def process_tags(tag_list, entities):
                         refined_tags.append(segment)
                     else:
                         # Tokenize non-entity segments
-                        nlp_text = nlp(segment)
-                        tokens = [token.lemma_.lower() for token in nlp_text if not token.is_stop and not token.is_punct]
+                        doc = nlp(segment)
+                        tokens, _ = extract_entities_and_tokens(doc)
                         refined_tags.extend(tokens)
                 
                 entity_found = True
@@ -100,63 +156,118 @@ def process_tags(tag_list, entities):
             
         if not entity_found:
             # Tokenize entire tag if no entity found
-            nlp_text = nlp(tag)
-            tokens = [token.lemma_.lower() for token in nlp_text if not token.is_stop and not token.is_punct and token.text.strip()]
+            doc = nlp(tag)
+            tokens, _ = extract_entities_and_tokens(doc)
             refined_tags.append(tag)
     
     refined_tags = [tag for tag in refined_tags if tag.strip()] # Remove empty elements & excessive whitespace
     return refined_tags
 
-def determine_topic(topic_tokens, top_n=3):
+def determine_topic(topic_tokens: list[str], top_n: int = 3) -> list[str]:
     token_frequency = Counter(topic_tokens)
     sorted_tokens = [token for token, _ in token_frequency.most_common()]
     
-    if sorted_tokens:
-        return sorted_tokens[:top_n]
-    else:
-        return ["unknown"]
+    return sorted_tokens[:top_n] if sorted_tokens else ["unknown"]
 
 # Read the CSV File
-def read_csv(csv):
-    df = pd.read_csv(csv)
-    processed_videos = []
+async def read_csv(csv: str) -> list[dict]:
+    try:
+        df = pd.read_csv(csv)
+    except pd.errors.EmptyDataError:
+        logging.error("%s is empty.", csv)
+        return []
+    except FileNotFoundError:
+        logging.error("Couldn't find file: %s", csv)
+        return []
+    except pd.errors.ParserError:
+        logging.error("Couldn't parse %s", csv)
+        return []
+    except Exception as e:
+        logging.error("Unexpected error while reading %s: %s", csv, e)
+        return []
     
-    for _, row in df.iterrows():
+    # Handle missing columns
+    missing_columns = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+    if missing_columns:
+        logging.error("%s is missing columns %s", csv, ", ".join(missing_columns))
+        return []
+    
+    # Filter out rows with missing or empty required fields
+    df = df.dropna(subset=["vsr", "description", "title"])
+    df = df[df["title"].str.strip() != ""]
+    df = df.reset_index(drop=True)
+    
+    # Group titles and descriptions for batch processing
+    titles = df["title"].tolist()
+    descriptions = df["description"].tolist()
+    
+    title_results = tokenize_texts(titles)
+    desc_results = tokenize_texts(descriptions)
+    
+    # Download video thumbnails asynchronously
+    os.makedirs(os.path.dirname("data/thumbnails"), exist_ok=True)
+    async with aiohttp.ClientSession() as session:
+        tasks = [
+            save_thumbnail(row["video_id"], session)
+            for _, row in df.iterrows()
+        ]
+        thumbnail_paths = await asyncio.gather(*tasks)
+    
+    processed_videos = []
+    for idx, row in df.iterrows():
+        if thumbnail_paths[idx] is None:
+            logging.warning("Skipping video %s due to missing thumbnail", row["video_id"])
+            continue
+
         video = {}
-        video_id = row["video_id"]
         title = row["title"]
-        
         video["title"] = title
-        video["thumbnail"] = save_thumbnail(video_id)
+        video["thumbnail"] = thumbnail_paths[idx]
         video["vsr"] = row["vsr"]
-                
-        title_tokens, title_entities = preprocess_text(title)
-        desc_tokens, desc_entities = preprocess_text(row["description"])
+        
+        title_tokens, title_entities = title_results[idx]
+        desc_tokens, desc_entities = desc_results[idx]
         entities = title_entities + desc_entities
         
-        tags_list = ast.literal_eval(row["tags"]) # Make sure the tags are in list format (sometimes it's stored as a string in csv files)
-        refined_tags = process_tags(tags_list, entities)
-        topic_tokens = [token.lower() for token in title_tokens + desc_tokens + refined_tags]
+        # Ensure the tags are formatted in a list
+        try:
+            tags_list = ast.literal_eval(row["tags"])
+            if not isinstance(tags_list, list):
+                raise ValueError(f"Tags for video {row['video_id']} are not a list.")
+        except (ValueError, SyntaxError) as e:
+            logging.error("Couldn't parse tags for video %s: %s", row["video_id"], e)
+            tags_list = []
+        
+        tag_tokens = tokenize_tags(tags_list, entities)
+        
+        # Combine all tokens & determine the topic
+        topic_tokens = [token.lower() for token in title_tokens + desc_tokens + tag_tokens]
         video["topic"] = determine_topic(topic_tokens)
         
         processed_videos.append(video)
-            
+        
     return processed_videos
+
+async def process_all_csvs(csv_files, processed_videos):
+    for csv_file in csv_files:
+        logging.info("Processing %s", csv_file)
+        os.makedirs("data/thumbnails", exist_ok=True)
+        
+        videos = await read_csv(csv_file)
+        logging.info("Processed %s videos from CSV %s", len(videos), csv_file)
+        processed_videos.extend(videos)
 
 if __name__ == "__main__":
     DIRECTORY = "data/raw"
     
     processed_videos = []
-    for file in os.listdir(DIRECTORY):
-        if file.endswith(".csv"):
-            cvs_file = os.path.join(DIRECTORY, file)
-            print(f"Processing {cvs_file}")
-            processed_videos.extend(read_csv(cvs_file))
-            
-            break # Process one csv for debugging
-            
-    print(f"Finished processing {len(processed_videos)} videos")
+    
+    csv_files = [os.path.join(DIRECTORY, file) for file in os.listdir(DIRECTORY) if file.endswith(".csv")]
+    asyncio.run(process_all_csvs(csv_files, processed_videos))
+
+    logging.info("Processed %s videos in total.", len(processed_videos))
     
     if processed_videos:
         processed_df = pd.DataFrame(processed_videos)
-        processed_df.to_csv("data/processed_videos.csv", index=False)
+        processed_df.to_csv("data/processed.csv", index=False)
+        

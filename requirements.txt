@@ -1,7 +1,8 @@
 pandas
 opencv-python
-requests
 spacy
 gensim
 transformers
 torch
+aiohttp
+tenacity
